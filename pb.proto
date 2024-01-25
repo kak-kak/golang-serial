@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+import "grpc_health_v1.proto";
+
+package example;
+
+service MyService {
+  rpc GetData(EmptyRequest) returns (ShortArrayResponse) {}
+}
+
+message EmptyRequest {}
+
+message ShortArrayResponse {
+  repeated int32 data = 1;
+}
+
+// ヘルスチェックのサービス定義も含める
+service Health {
+  rpc Check(grpc.health.v1.HealthCheckRequest) returns (grpc.health.v1.HealthCheckResponse) {}
+}

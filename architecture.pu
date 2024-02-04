@@ -1,0 +1,24 @@
+@startuml
+participant "main thread" as main
+participant "hm parse thread" as hm
+participant "time keeper thread" as tkc
+participant "camera management thread" as cam
+participant "hm management thread" as hmm
+participant "tc management Process (python)" as tc
+
+main ->> hm: start hm management
+group hm loop process
+hm ->> main : return latest data continuously
+end
+main ->> tkc : start time keeper
+group Record process
+tkc ->> main : return record process starter every 1 second
+main ->> cam : instruct record camera
+cam -> cam : fetch and export data to file
+main ->> hmm : instruct record hm
+hmm -> hmm : fetch and export data to file
+main -> tc: fetch tc data (grpc unary)
+tc -> main : return data
+main -> main : export data to file
+end 
+@enduml

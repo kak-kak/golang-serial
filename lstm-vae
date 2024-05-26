@@ -1,0 +1,163 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import cv2
+import numpy as np
+import json
+import os
+from datetime import datetime
+import matplotlib.pyplot as plt
+
+# Define the dataset
+class WaveDataset(Dataset):
+    def __init__(self, json_file, transform=None):
+        with open(json_file, 'r') as f:
+            self.metadata = json.load(f)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        item = self.metadata[idx]
+        video_path = item['filename']
+        wave_start_frame = item['parameters']['wave_start_frame']
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = frame / 255.0  # Normalize
+            frames.append(frame)
+        cap.release()
+        frames = np.array(frames)
+        if self.transform:
+            frames = self.transform(frames)
+        return torch.tensor(frames, dtype=torch.float32), wave_start_frame
+
+class DeepVAELSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim1, hidden_dim2, hidden_dim3, latent_dim, lstm_hidden_dim, num_layers):
+        super(DeepVAELSTM, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim1)
+        self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.fc3 = nn.Linear(hidden_dim2, hidden_dim3)
+        self.fc4_mu = nn.Linear(hidden_dim3, latent_dim)
+        self.fc4_logvar = nn.Linear(hidden_dim3, latent_dim)
+        self.lstm = nn.LSTM(latent_dim, lstm_hidden_dim, num_layers, batch_first=True)
+        self.fc5 = nn.Linear(lstm_hidden_dim, hidden_dim3)
+        self.fc6 = nn.Linear(hidden_dim3, hidden_dim2)
+        self.fc7 = nn.Linear(hidden_dim2, hidden_dim1)
+        self.fc8 = nn.Linear(hidden_dim1, input_dim)
+    
+    def encode(self, x):
+        h1 = torch.relu(self.fc1(x))
+        h2 = torch.relu(self.fc2(h1))
+        h3 = torch.relu(self.fc3(h2))
+        return self.fc4_mu(h3), self.fc4_logvar(h3)
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z):
+        h5 = torch.relu(self.fc5(z))
+        h6 = torch.relu(self.fc6(h5))
+        h7 = torch.relu(self.fc7(h6))
+        return torch.sigmoid(self.fc8(h7))
+    
+    def forward(self, x):
+        batch_size, seq_len, _ = x.size()
+        x = x.view(batch_size * seq_len, -1)
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        z = z.view(batch_size, seq_len, -1)
+        lstm_out, _ = self.lstm(z)
+        lstm_out = lstm_out.contiguous().view(batch_size * seq_len, -1)
+        decoded = self.decode(lstm_out)
+        return decoded.view(batch_size, seq_len, -1), mu, logvar
+
+# Hyperparameters
+input_dim = 400 * 400
+hidden_dim1 = 512
+hidden_dim2 = 256
+hidden_dim3 = 128
+latent_dim = 64
+lstm_hidden_dim = 128
+num_layers = 2
+learning_rate = 0.001
+num_epochs = 50
+batch_size = 8
+
+def loss_function(recon_x, x, mu, logvar):
+    BCE = nn.functional.binary_cross_entropy(recon_x.view(-1, input_dim), x.view(-1, input_dim), reduction='sum')
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return BCE + KLD
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load dataset
+dataset = WaveDataset('wave_sequence_metadata.json')
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# Initialize the model, loss function, and optimizer
+model = DeepVAELSTM(input_dim, hidden_dim1, hidden_dim2, hidden_dim3, latent_dim, lstm_hidden_dim, num_layers).to(device)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Training loop
+for epoch in range(num_epochs):
+    for i, (videos, targets) in enumerate(dataloader):
+        batch_size, seq_len, height, width = videos.size()
+        
+        # Flatten the spatial dimensions
+        videos = videos.view(batch_size, seq_len, -1).to(device)
+        
+        # Use only the frames before wave_start_frame for training
+        train_frames = []
+        max_wave_start_frame = max(targets).item()  # Find the maximum wave_start_frame in the batch
+        for video, wave_start_frame in zip(videos, targets):
+            frames_to_use = video[:wave_start_frame]
+            padded_frames = torch.zeros((max_wave_start_frame, 400 * 400)).to(device)
+            padded_frames[:frames_to_use.size(0), :] = frames_to_use
+            train_frames.append(padded_frames)
+        
+        train_frames = torch.stack(train_frames)
+
+        # Reshape for LSTM input: (batch_size, seq_len, input_dim)
+        train_frames = train_frames.view(batch_size, max_wave_start_frame, 400 * 400)
+
+        recon_frames, mu, logvar = model(train_frames)
+        loss = loss_function(recon_frames, train_frames, mu, logvar)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if (i+1) % 10 == 0:
+            print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}')
+
+print("Training complete.")
+
+# Anomaly detection and plotting
+for i, (videos, targets) in enumerate(dataloader):
+    videos = videos.to(device).view(batch_size, -1, 400, 400)  # Reshape for LSTM input
+    videos = videos.view(batch_size, -1, 400 * 400)
+    recon_videos, _, _ = model(videos)
+    recon_videos = recon_videos.view(batch_size, -1, 400, 400)
+
+    # Compute reconstruction error
+    recon_error = torch.mean((videos.view(batch_size, -1, 400, 400) - recon_videos) ** 2, dim=[2, 3])
+
+    for j in range(recon_error.size(0)):
+        plt.figure()
+        plt.plot(recon_error[j].cpu().detach().numpy())
+        plt.title(f'Video {i*batch_size + j} Anomaly Score')
+        plt.xlabel('Frame')
+        plt.ylabel('Reconstruction Error')
+        plt.savefig(f'video_{i*batch_size + j}_anomaly_score.png')
+
+print("Anomaly detection complete.")

@@ -1,0 +1,154 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import cv2
+import numpy as np
+import json
+import os
+from datetime import datetime
+
+# Define the dataset
+class WaveDataset(Dataset):
+    def __init__(self, json_file, transform=None):
+        with open(json_file, 'r') as f:
+            self.metadata = json.load(f)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        item = self.metadata[idx]
+        video_path = item['filename']
+        wave_start_frame = item['parameters']['wave_start_frame']
+        cap = cv2.VideoCapture(video_path)
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = frame / 255.0  # Normalize
+            frames.append(frame)
+        cap.release()
+        frames = np.array(frames)
+        if self.transform:
+            frames = self.transform(frames)
+        return torch.tensor(frames, dtype=torch.float32), wave_start_frame
+
+class DeepVAE(nn.Module):
+    def __init__(self, input_dim, hidden_dim1, hidden_dim2, hidden_dim3, latent_dim):
+        super(DeepVAE, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim1)
+        self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
+        self.fc3 = nn.Linear(hidden_dim2, hidden_dim3)
+        self.fc4_mu = nn.Linear(hidden_dim3, latent_dim)
+        self.fc4_logvar = nn.Linear(hidden_dim3, latent_dim)
+        self.fc5 = nn.Linear(latent_dim, hidden_dim3)
+        self.fc6 = nn.Linear(hidden_dim3, hidden_dim2)
+        self.fc7 = nn.Linear(hidden_dim2, hidden_dim1)
+        self.fc8 = nn.Linear(hidden_dim1, input_dim)
+    
+    def encode(self, x):
+        h1 = torch.relu(self.fc1(x))
+        h2 = torch.relu(self.fc2(h1))
+        h3 = torch.relu(self.fc3(h2))
+        return self.fc4_mu(h3), self.fc4_logvar(h3)
+    
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+    def decode(self, z):
+        h5 = torch.relu(self.fc5(z))
+        h6 = torch.relu(self.fc6(h5))
+        h7 = torch.relu(self.fc7(h6))
+        return torch.sigmoid(self.fc8(h7))
+    
+    def forward(self, x):
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z), mu, logvar
+
+# Hyperparameters
+input_dim = 400 * 400
+hidden_dim1 = 512
+hidden_dim2 = 256
+hidden_dim3 = 128
+latent_dim = 64
+learning_rate = 0.001
+num_epochs = 50
+batch_size = 8
+
+def loss_function(recon_x, x, mu, logvar):
+    BCE = nn.functional.binary_cross_entropy(recon_x, x, reduction='sum')
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return BCE + KLD
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load dataset
+dataset = WaveDataset('wave_sequence_metadata.json')
+dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+# Initialize the model, loss function, and optimizer
+model = DeepVAE(input_dim, hidden_dim1, hidden_dim2, hidden_dim3, latent_dim).to(device)
+optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+# Training loop
+for epoch in range(num_epochs):
+    for i, (videos, targets) in enumerate(dataloader):
+        # Use only the frames before wave_start_frame for training
+        train_frames = []
+        for video, wave_start_frame in zip(videos, targets):
+            train_frames.append(video[:wave_start_frame])
+        train_frames = torch.cat(train_frames).to(device)
+        
+        train_frames = train_frames.view(-1, input_dim)  # Flatten the frames
+        
+        recon_frames, mu, logvar = model(train_frames)
+        loss = loss_function(recon_frames, train_frames, mu, logvar)
+        
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        if (i+1) % 10 == 0:
+            print(f'Epoch [{epoch+1}/{num_epochs}], Step [{i+1}/{len(dataloader)}], Loss: {loss.item():.4f}')
+
+print("Training complete.")
+
+# # Anomaly detection
+# for i, (videos, targets) in enumerate(dataloader):
+#     videos = videos.to(device).view(-1, 100, input_dim)  # Flatten the frames
+#     recon_videos, _, _ = model(videos.view(-1, input_dim))
+#     recon_videos = recon_videos.view(-1, 100, 400, 400)
+    
+#     # Compute reconstruction error
+#     recon_error = torch.mean((videos.view(-1, 100, 400, 400) - recon_videos) ** 2, dim=[2, 3])
+    
+#     for j in range(recon_error.size(0)):
+#         for k in range(recon_error.size(1)):
+#             print(f'Video {i*batch_size + j}, Frame {k}, Anomaly score: {recon_error[j, k].item():.4f}')
+
+
+import matplotlib.pyplot as plt
+# Anomaly detection and plotting
+for i, (videos, targets) in enumerate(dataloader):
+    videos = videos.to(device).view(-1, 100, input_dim)  # Flatten the frames
+    recon_videos, _, _ = model(videos.view(-1, input_dim))
+    recon_videos = recon_videos.view(-1, 100, 400, 400)
+    
+    # Compute reconstruction error
+    recon_error = torch.mean((videos.view(-1, 100, 400, 400) - recon_videos) ** 2, dim=[2, 3])
+    
+    for j in range(recon_error.size(0)):
+        plt.figure()
+        plt.plot(recon_error[j].cpu().detach().numpy())
+        plt.title(f'Video {i*batch_size + j} Anomaly Score')
+        plt.xlabel('Frame')
+        plt.ylabel('Reconstruction Error')
+        plt.savefig(f'video_{i*batch_size + j}_anomaly_score.png')

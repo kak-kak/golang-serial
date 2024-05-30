@@ -1,0 +1,19 @@
+// Save the original XMLHttpRequest open method
+const originalOpen = XMLHttpRequest.prototype.open;
+
+// Define the new open method
+XMLHttpRequest.prototype.open = function(method: string, url: string, async: boolean = true, user?: string, password?: string): void {
+    // Custom logic before opening the request
+    console.log(`Opening request: Method=${method}, URL=${url}, Async=${async}`);
+
+    // Call the original open method with the provided arguments
+    originalOpen.apply(this, [method, url, async, user, password]);
+
+    // Custom logic after opening the request
+    console.log('Request opened successfully');
+};
+
+// Usage example
+const xhr = new XMLHttpRequest();
+xhr.open('GET', 'https://example.com/api/data', true);
+xhr.send();
